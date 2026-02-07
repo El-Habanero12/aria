@@ -170,3 +170,6 @@ lightning_logs/
 paper
 hf
 _scripts
+
+
+models/
