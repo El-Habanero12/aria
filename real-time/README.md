@@ -25,7 +25,7 @@ Example flow:
 - **Windows 11** with CUDA-compatible GPU (tested on RTX 4070)
 - **Python 3.10+** with PyTorch CUDA support
 - **Ableton Live** (any version)
-- **loopMIDI**: Download from https://www.tobias-eichner.de/software/loopmidi/
+- **loopMIDI**: Download from https://www.tobias-erichsen.de/software/loopmidi.html
 
 ### 1. Install loopMIDI
 
