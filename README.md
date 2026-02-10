@@ -11,7 +11,7 @@ This repository contains training, inference, and evaluation code for the paper 
 Installation requires Python 3.11+. To install the package and all dependencies with pip:
 
 ```bash
-git clone https://github.com/El-Habanero12/aria 
+git clone https://github.com/EleutherAI/aria 
 cd aria
 pip install -e ".[all]"
 ```
