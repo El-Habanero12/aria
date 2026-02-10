@@ -10,6 +10,93 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+class GenerationJob:
+    """A job to generate music for a specific bar/bars."""
+    def __init__(self, bar_index: int, prompt_events: list, aria_engine, temperature: float, top_p: float, gen_bars: int = 2):
+        self.bar_index = bar_index  # Starting bar index
+        self.prompt_events = prompt_events
+        self.aria_engine = aria_engine
+        self.temperature = temperature
+        self.top_p = top_p
+        self.gen_bars = gen_bars  # Number of measures to generate
+        self.result_midi_path = None  # Set when generation completes
+
+
+class GenerationWorker(threading.Thread):
+    """Background thread that processes generation jobs asynchronously."""
+    
+    def __init__(self, job_queue: queue.Queue):
+        """
+        Args:
+            job_queue: Queue of GenerationJob objects
+        """
+        super().__init__(daemon=True)
+        self.job_queue = job_queue
+        self.running = False
+
+    def run(self):
+        """Process generation jobs from queue."""
+        logger.info("GenerationWorker thread started")
+        try:
+            while self.running:
+                try:
+                    job = self.job_queue.get(timeout=0.1)
+                    if job is None:  # Sentinel to stop
+                        break
+                    
+                    logger.info(f"[gen_worker] Starting generation for bar {job.bar_index} ({job.gen_bars} bars)")
+                    
+                    # Build prompt MIDI
+                    try:
+                        from .prompt_midi import buffer_to_tempfile_midi
+                    except Exception:
+                        from prompt_midi import buffer_to_tempfile_midi
+                    
+                    prompt_midi_path = buffer_to_tempfile_midi(
+                        job.prompt_events,
+                        window_seconds=0,
+                        ticks_per_beat=480,
+                    )
+                    
+                    # Call Aria to generate N bars
+                    start_time = time.time()
+                    try:
+                        # Horizon in seconds: gen_bars * 1.0s per bar (roughly)
+                        horizon_s = job.gen_bars * 1.0
+                        midi_path = job.aria_engine.generate(
+                            prompt_midi_path=prompt_midi_path,
+                            prompt_duration_s=4,
+                            horizon_s=horizon_s,
+                            temperature=job.temperature,
+                            top_p=job.top_p,
+                        )
+                        gen_time = time.time() - start_time
+                        
+                        if midi_path:
+                            job.result_midi_path = midi_path
+                            logger.info(f"[gen_worker] Bar {job.bar_index} ({job.gen_bars}-bar generation) done in {gen_time:.2f}s")
+                        else:
+                            logger.warning(f"[gen_worker] Bar {job.bar_index} generation returned None")
+                    except Exception as e:
+                        logger.exception(f"[gen_worker] Bar {job.bar_index} generation failed: {e}")
+                        job.error = str(e)
+                    finally:
+                        # Cleanup prompt
+                        try:
+                            os.unlink(prompt_midi_path)
+                        except Exception:
+                            pass
+                    
+                    self.job_queue.task_done()
+                    
+                except queue.Empty:
+                    pass
+        except Exception as e:
+            logger.exception(f"GenerationWorker error: {e}")
+        finally:
+            logger.info("GenerationWorker thread stopped")
+
+
 class AbletonBridge:
     """
     Orchestrates real-time MIDI I/O and Aria generation.
@@ -39,8 +126,8 @@ class AbletonBridge:
         beats_per_bar: int = 4,
         gen_measures: Optional[int] = None,
         cooldown_seconds: float = 0.2,
-        temperature: float = 0.9,
-        top_p: float = 0.95,
+        temperature: float = 0.8,
+        top_p: float = 0.9,
         quantize: bool = False,
         ticks_per_beat: int = 480,
     ):
@@ -88,8 +175,8 @@ class AbletonBridge:
         self.threads = []
 
         # PHASE state machine
-        self.PHASE_HUMAN = 'human'
-        self.PHASE_MODEL = 'model'
+        self.PHASE_HUMAN = 'human'       # Collecting human input
+        self.PHASE_AI_PLAY = 'ai_play'   # Playing AI N-measure response
         self.phase = self.PHASE_HUMAN
 
         # ClockGrid will be set if clock_in provided
@@ -123,6 +210,13 @@ class AbletonBridge:
         self.last_generation_time = time.time()
         self.failsafe_forced = False
 
+        # Asynchronous generation worker for MVP (1-bar-in → N-measures-out cycle)
+        self.gen_job_queue = queue.Queue()
+        self.pending_ai_job = None  # Current job being processed
+        self.pending_ai_response = None  # Path to N-measure MIDI when ready
+        self.pending_ai_response_lock = threading.RLock()
+        self.gen_worker = GenerationWorker(self.gen_job_queue)
+
     def run(self):
         """Start the bridge: input, generation, output threads."""
         try:
@@ -142,6 +236,10 @@ class AbletonBridge:
                 except Exception as e:
                     logger.warning(f"Failed to start ClockGrid: {e}")
             self.running = True
+
+            # Start generation worker
+            self.gen_worker.running = True
+            self.gen_worker.start()
 
             # Start threads
             t_input = threading.Thread(target=self._input_loop, daemon=True)
@@ -168,6 +266,12 @@ class AbletonBridge:
     def shutdown(self):
         """Stop all threads and close ports."""
         self.running = False
+        self.gen_worker.running = False
+
+        # Wait for generation worker to finish
+        if self.gen_worker.is_alive():
+            self.gen_job_queue.put(None)  # Send sentinel
+            self.gen_worker.join(timeout=2)
 
         for t in self.threads:
             t.join(timeout=2)
@@ -279,22 +383,46 @@ class AbletonBridge:
                         logger.info(f"[HUMAN] bar={bar} note_on pitch={msg.note} vel={msg.velocity} pulse={pulse}")
 
                     elif msg.type == 'note_off':
+                        # Assign note_off to the same bar as note_on
+                        if self.anchor_pulse is not None and pulse is not None:
+                            pulses_per_bar = self.clock_grid.get_pulses_per_bar()
+                            bar = (pulse - self.anchor_pulse) // pulses_per_bar
+                            if bar not in self.human_bar_buffers:
+                                self.human_bar_buffers[bar] = []
+                        else:
+                            bar = None
+
+                        msg_obj = type('MidiMsg', (), {'pulse': pulse, 'msg_type': 'note_off', 'note': msg.note, 'velocity': msg.velocity})()
                         self.midi_buffer.add_message(
                             'note_off',
                             note=msg.note,
                             velocity=msg.velocity,
                             pulse=pulse,
                         )
-                        logger.debug(f"[HUMAN] note_off pitch={msg.note} pulse={pulse}")
+                        if bar is not None:
+                            self.human_bar_buffers[bar].append(msg_obj)
+                        logger.debug(f"[HUMAN] bar={bar} note_off pitch={msg.note} pulse={pulse}")
 
                     elif msg.type == 'control_change' and msg.control == 64:
+                        # Sustain pedal - assign to bar buffer
+                        if self.anchor_pulse is not None and pulse is not None:
+                            pulses_per_bar = self.clock_grid.get_pulses_per_bar()
+                            bar = (pulse - self.anchor_pulse) // pulses_per_bar
+                            if bar not in self.human_bar_buffers:
+                                self.human_bar_buffers[bar] = []
+                        else:
+                            bar = None
+
+                        msg_obj = type('MidiMsg', (), {'pulse': pulse, 'msg_type': 'control_change', 'control': 64, 'value': msg.value})()
                         self.midi_buffer.add_message(
                             'control_change',
                             control=64,
                             value=msg.value,
                             pulse=pulse,
                         )
-                        logger.debug(f"[HUMAN] sustain {msg.value} pulse={pulse}")
+                        if bar is not None:
+                            self.human_bar_buffers[bar].append(msg_obj)
+                        logger.debug(f"[HUMAN] bar={bar} sustain={msg.value} pulse={pulse}")
 
                 time.sleep(0.001)  # Small sleep to avoid busy loop
 
@@ -302,13 +430,22 @@ class AbletonBridge:
             logger.exception(f"Input loop error: {e}")
 
     def _generation_loop(self):
-        """Monitor bar boundaries and generate per-bar, scheduling playback after 2 bars."""
-        logger.info("Generation thread started (per-bar pipeline)")
+        """
+        MVP Generation Loop:
+        - Monitor bar boundaries (PHASE_HUMAN)
+        - Check if AI response is ready and schedule it (if PHASE_HUMAN and response ready)
+        - Block during PHASE_AI_PLAY (no new generation)
+        """
+        logger.info(f"Generation thread started (MVP 1-bar-in -> {self.gen_measures}-measures-out)")
         try:
             last_failsafe_check = time.time()
             while self.running:
-                # Bar-based boundary detection
-                if self.clock_grid and self.next_bar_boundary_pulse is not None:
+                # Check for pending AI response ready to schedule
+                if self.phase == self.PHASE_HUMAN and self.pending_ai_job is not None:
+                    self._check_and_schedule_ai_response()
+
+                # Bar-based boundary detection (only in HUMAN phase)
+                if self.phase == self.PHASE_HUMAN and self.clock_grid and self.next_bar_boundary_pulse is not None:
                     current_pulse = self.clock_grid.get_pulse_count()
                     if current_pulse >= self.next_bar_boundary_pulse:
                         finished_bar = self.bar_index
@@ -318,13 +455,13 @@ class AbletonBridge:
                         self.bar_index += 1
                         self.next_bar_boundary_pulse += pulses_per_bar
 
-                # Failsafe: force generation after 6 seconds if anchor is set but no generation occurred
+                # Failsafe check
                 now = time.time()
                 if (now - last_failsafe_check > 6.0) and self.anchor_pulse is not None:
                     all_msgs = self.midi_buffer.get_messages()
                     has_notes = any(m.msg_type == 'note_on' and m.velocity > 0 for m in all_msgs)
                     if has_notes and not self.failsafe_forced:
-                        logger.warning(f"[FAILSAFE] No generation in 6s despite human input. Forcing generation.")
+                        logger.warning(f"[FAILSAFE] No generation in 6s despite human input.")
                         self.failsafe_forced = True
                     last_failsafe_check = now
 
@@ -382,7 +519,10 @@ class AbletonBridge:
             logger.exception(f"Output loop error: {e}")
 
     def _service_scheduled_messages(self):
-        """Send any scheduled model messages whose target_pulse <= current pulse."""
+        """Send any scheduled model messages whose target_pulse <= current pulse.
+        
+        Ensures events are removed from queue after sending (one-shot, no repeats).
+        """
         if not self.clock_grid:
             return
 
@@ -398,7 +538,7 @@ class AbletonBridge:
                     remaining.append((target_pulse, msg))
             self.scheduled_messages = remaining
 
-        # Send messages due
+        # Send messages due (one-shot: removed from queue immediately after)
         for tp, msg in to_send:
             try:
                 self.out_port.send(msg)
@@ -406,95 +546,213 @@ class AbletonBridge:
             except Exception:
                 logger.exception("Failed to send scheduled message")
 
-        # If model end pulse reached, switch back to HUMAN
+        # If model end pulse reached, switch back to HUMAN and clear buffers
         if self.model_end_pulse is not None and current_pulse >= self.model_end_pulse:
-            if self.phase == self.PHASE_MODEL:
-                logger.info(f"MODEL -> HUMAN after playback (pulse={current_pulse})")
+            if self.phase == self.PHASE_AI_PLAY:
+                queue_size = len(self.scheduled_messages)
+                logger.info(f"[phase] AI_PLAY -> HUMAN at pulse={current_pulse}, playback finished, queue_size={queue_size}")
+                if queue_size > 0:
+                    logger.warning(f"[service] {queue_size} events still queued, clearing.")
+                    with self.scheduled_lock:
+                        self.scheduled_messages.clear()
+                # Clear human buffers for next cycle
+                self.human_bar_buffers.clear()
+                logger.debug("[service] Cleared human_bar_buffers for next cycle")
             self.phase = self.PHASE_HUMAN
             self.model_end_pulse = None
 
-    # _on_anchor_boundary deprecated: use _on_bar_boundary instead (pipelined mode)
+    # _on_anchor_boundary deprecated: use _on_bar_boundary instead
 
     def _on_bar_boundary(self, finished_bar: int):
-        """Handle end-of-bar boundary. Generate 1 bar for this bar index."""
+        """
+        MVP Cycle: 1-bar-in → N-measures-out (configurable via --measures)
+        
+        PHASE_HUMAN:
+        - Collect input for current bar
+        - At bar boundary: if no AI playback pending, trigger N-measure generation
+        - Switch to PHASE_AI_PLAY once response is ready
+        
+        PHASE_AI_PLAY:
+        - Play the N-measure AI response
+        - Do NOT trigger new generation (block generation while playing)
+        - At playback end: switch back to PHASE_HUMAN, clear buffers
+        """
         try:
-            logger.info(f"[bar_boundary] finished_bar={finished_bar}, anchor={self.anchor_pulse}")
+            logger.info(f"[bar_boundary] finished_bar={finished_bar}, phase={self.phase}")
 
-            # Extract human events for this bar
-            if finished_bar not in self.human_bar_buffers:
-                logger.info(f"[bar_boundary] No human events for bar {finished_bar}")
-                return
+            if self.phase == self.PHASE_HUMAN:
+                # Check if we should trigger generation
+                if finished_bar not in self.human_bar_buffers:
+                    logger.info(f"[bar_boundary] No human events for bar {finished_bar}, skipping generation")
+                    return
 
-            human_events = self.human_bar_buffers[finished_bar]
-            if not human_events:
-                logger.info(f"[bar_boundary] Empty buffer for bar {finished_bar}")
-                return
+                human_events = self.human_bar_buffers[finished_bar]
+                if not human_events:
+                    logger.info(f"[bar_boundary] Empty buffer for bar {finished_bar}, skipping generation")
+                    return
 
-            logger.info(f"[bar_boundary] Bar {finished_bar}: {len(human_events)} human events")
+                logger.info(f"[bar_boundary] Bar {finished_bar}: {len(human_events)} prompt events, triggering 2-bar generation")
 
-            # Build prompt MIDI for this single bar
-            try:
-                from .prompt_midi import buffer_to_tempfile_midi
-            except Exception:
-                from prompt_midi import buffer_to_tempfile_midi
+                # Get prompt context: use last 2 bars if available
+                prompt_events = human_events
+                if finished_bar >= 1 and finished_bar - 1 in self.human_bar_buffers:
+                    prev_events = self.human_bar_buffers[finished_bar - 1]
+                    prompt_events = prev_events + human_events  # 2-bar context (fixed prompt window, independent of output measures)
 
-            prompt_midi_path = buffer_to_tempfile_midi(
-                human_events,
-                window_seconds=0,
-                current_bpm=(self.tempo_tracker.get_bpm() if self.tempo_tracker else None),
-                ticks_per_beat=self.ticks_per_beat,
-            )
+                # Enqueue generation job for N measures
+                job = GenerationJob(
+                    bar_index=finished_bar,
+                    prompt_events=prompt_events,
+                    aria_engine=self.aria_engine,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    gen_bars=self.gen_measures,  # Generate N measures per cycle
+                )
+                self.pending_ai_job = job
+                self.gen_job_queue.put(job)
+                logger.info(f"[enqueue] {self.gen_measures}-measure generation job for bar {finished_bar} queued")
+                self.last_generation_time = time.time()
+                self.generation_count += 1
 
-            # Estimate horizon for 1 bar
-            if self.tempo_tracker:
-                bpm = self.tempo_tracker.get_bpm()
-                sec_per_beat = 60.0 / max(1.0, bpm)
-            else:
-                sec_per_beat = 0.5
-
-            horizon_s = 1 * self.beats_per_bar * sec_per_beat
-
-            logger.info(f"[generate] bar={finished_bar}, horizon_s={horizon_s:.2f}s")
-
-            start_time = time.time()
-            generated_midi_path = self.aria_engine.generate(
-                prompt_midi_path=prompt_midi_path,
-                prompt_duration_s=0,
-                horizon_s=horizon_s,
-                temperature=self.temperature,
-                top_p=self.top_p,
-            )
-            gen_time = time.time() - start_time
-            self.generation_times.append(gen_time)
-
-            if generated_midi_path is None:
-                logger.warning(f"[bar_boundary] Generation returned None for bar {finished_bar}")
-                try:
-                    os.unlink(prompt_midi_path)
-                except Exception:
-                    pass
-                return
-
-            # Parse generated MIDI and store
-            self._parse_generated_midi_for_bar(finished_bar, generated_midi_path)
-            self.last_generation_time = time.time()
-            self.generation_count += 1
-
-            # Check if we can schedule playback (when finished_bar is odd, i.e., 1, 3, 5,...)
-            if finished_bar % 2 == 1 and (finished_bar - 1) in self.generated_bar_queue and finished_bar in self.generated_bar_queue:
-                # Both previous and current bar are generated
-                previous_bar = finished_bar - 1
-                self._schedule_2bar_playback(previous_bar, finished_bar)
-                self.last_scheduled_bar = finished_bar
-
-            # Cleanup prompt MIDI
-            try:
-                os.unlink(prompt_midi_path)
-            except Exception:
-                pass
+            elif self.phase == self.PHASE_AI_PLAY:
+                # Block new generation while AI is playing - just log
+                logger.debug(f"[bar_boundary] In PHASE_AI_PLAY, skipping generation trigger")
 
         except Exception as e:
             logger.exception(f"Error on bar boundary: {e}")
+
+    def _check_and_schedule_ai_response(self):
+        """
+        Check if the pending AI job has finished generation.
+        If ready, schedule the N-measure response and switch to PHASE_AI_PLAY.
+        """
+        if self.pending_ai_job is None or self.pending_ai_job.result_midi_path is None:
+            return  # Not ready yet
+
+        midi_path = self.pending_ai_job.result_midi_path
+        job_bar = self.pending_ai_job.bar_index
+        
+        logger.info(f"[ai_ready] {self.gen_measures}-measure response ready for job at bar {job_bar}, scheduling playback")
+        
+        # Get current pulse as boundary for playback
+        if not self.clock_grid:
+            logger.warning("[ai_ready] No clock grid available, cannot schedule")
+            return
+        
+        boundary_pulse = self.clock_grid.get_pulse_count()
+        pulses_per_bar = self.clock_grid.get_pulses_per_bar()
+        
+        # Schedule the N-measure playback
+        self._schedule_two_bar_response(midi_path, boundary_pulse, pulses_per_bar)
+        
+        # Switch phase
+        self.phase = self.PHASE_AI_PLAY
+        self.pending_ai_job = None  # Clear pending job
+        
+        logger.info(f"[phase] HUMAN -> AI_PLAY at pulse={boundary_pulse}")
+
+    def _schedule_two_bar_response(self, midi_path: str, boundary_pulse: int, pulses_per_bar: int):
+        """
+        Schedule an N-measure AI response for playback.
+        
+        Enforces strict N-measure limit:
+        - Keep only events with 0 <= offset_pulse < N*pulses_per_bar
+        - Force note-offs for any unclosed notes
+        - Send CC123 at end
+        """
+        try:
+            import mido
+            
+            max_offset_pulses = self.gen_measures * pulses_per_bar  # N measures in pulses
+            
+            mid = mido.MidiFile(midi_path)
+            tpq = mid.ticks_per_beat if mid.ticks_per_beat else self.ticks_per_beat
+            
+            messages = []
+            active_notes = {}  # {pitch: velocity} for unclosed notes
+            abs_tick = 0
+            
+            # Parse MIDI and apply N-measure limit
+            for track in mid.tracks:
+                abs_tick = 0
+                for msg in track:
+                    abs_tick += msg.time
+                    if not hasattr(msg, 'type'):
+                        continue
+                    
+                    # Compute offset in pulses
+                    offset_pulses = int((abs_tick / float(tpq)) * 24.0)
+                    
+                    # **ENFORCE N-measure limit**: Discard events beyond boundary
+                    if offset_pulses >= max_offset_pulses:
+                        logger.debug(f"[schedule_2bar] Discarding event at offset={offset_pulses} (>= limit {max_offset_pulses})")
+                        continue
+                    
+                    target_pulse = boundary_pulse + offset_pulses
+                    
+                    if msg.type == 'note_on' and msg.velocity > 0:
+                        active_notes[msg.note] = msg.velocity
+                        messages.append((target_pulse, msg.copy()))
+                    
+                    elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                        if msg.note in active_notes:
+                            del active_notes[msg.note]
+                        messages.append((target_pulse, msg.copy()))
+                    
+                    elif msg.type == 'control_change':
+                        messages.append((target_pulse, msg.copy()))
+            
+            # **ENFORCE**: Force note-offs for unclosed notes at N-measure end
+            end_pulse = boundary_pulse + max_offset_pulses
+            for pitch in list(active_notes.keys()):
+                note_off = mido.Message('note_off', note=pitch, velocity=0)
+                messages.append((end_pulse, note_off))
+                logger.debug(f"[schedule_2bar] Forced note_off for pitch {pitch} at {self.gen_measures}-measure end")
+            
+            # Send CC123 at end
+            all_notes_off = mido.Message('control_change', control=123, value=0)
+            messages.append((end_pulse, all_notes_off))
+            
+            # Sort by target_pulse
+            messages.sort(key=lambda x: x[0])
+            
+            # Clear old events and schedule new ones
+            queue_size_before = len(self.scheduled_messages)
+            if queue_size_before > 0:
+                logger.warning(f"[schedule_2bar] Clearing {queue_size_before} old scheduled events before new response")
+            
+            with self.scheduled_lock:
+                self.scheduled_messages.clear()
+                self.scheduled_messages.extend(messages)
+            
+            # Set model end pulse
+            self.model_end_pulse = end_pulse
+            
+            # Log pulse ranges
+            if messages:
+                pulse_min = min(tp for tp, _ in messages)
+                pulse_max = max(tp for tp, _ in messages)
+                logger.info(
+                    f"[schedule_2bar] {self.gen_measures}-measure response: {len(messages)} events in pulse [{boundary_pulse}..{end_pulse}), "
+                    f"min={pulse_min} max={pulse_max}"
+                )
+            
+            # Cleanup temp MIDI
+            try:
+                os.unlink(midi_path)
+            except Exception:
+                pass
+        
+        except Exception as e:
+            logger.exception(f"Failed to schedule {self.gen_measures}-measure response: {e}")
+
+    def _try_schedule_ready_bar(self, current_bar: int):
+        """DEPRECATED: use _check_and_schedule_ai_response for MVP"""
+        pass
+
+    def _schedule_single_bar_playback(self, bar_index: int, midi_path: str, boundary_pulse: int):
+        """DEPRECATED: use _schedule_two_bar_response for MVP"""
+        pass
 
     def _on_block_boundary(self, boundary_pulse: int):
         """Legacy handler - not used in pipelined mode. Kept for compatibility."""
@@ -560,46 +818,12 @@ class AbletonBridge:
             logger.exception(f"Failed to parse generated MIDI for bar {bar_index}: {e}")
 
     def _schedule_2bar_playback(self, bar1: int, bar2: int):
-        """Schedule playback of 2 consecutive bars aligned to pulse grid."""
-        try:
-            if bar1 not in self.generated_bar_queue or bar2 not in self.generated_bar_queue:
-                logger.error(f"[schedule_2bar] Bar {bar1} or {bar2} not in queue")
-                return
-
-            # Compute start pulse for playback (at the boundary of bar2)
-            pulses_per_bar = self.clock_grid.get_pulses_per_bar()
-            start_pulse = self.anchor_pulse + (bar2 + 1) * pulses_per_bar
-
-            # Convert bar MIDI messages to pulse-absolute timings
-            messages = []
-            bar1_msgs = self.generated_bar_queue[bar1]
-            bar2_msgs = self.generated_bar_queue[bar2]
-
-            # Bar 1 messages: in range [start_pulse, start_pulse + pulses_per_bar)
-            tpq = self.ticks_per_beat
-            abs_tick = 0
-            for msg in bar1_msgs:
-                abs_tick += msg.time
-                pulse_delta = int((abs_tick / float(tpq)) * 24.0)
-                target_pulse = start_pulse + pulse_delta
-                messages.append((target_pulse, msg.copy()))
-
-            # Bar 2 messages: in range [start_pulse + pulses_per_bar, start_pulse + 2*pulses_per_bar)
-            abs_tick = 0
-            for msg in bar2_msgs:
-                abs_tick += msg.time
-                pulse_delta = int((abs_tick / float(tpq)) * 24.0)
-                target_pulse = start_pulse + pulses_per_bar + pulse_delta
-                messages.append((target_pulse, msg.copy()))
-
-            # Queue for output
-            with self.scheduled_lock:
-                self.scheduled_messages.extend(messages)
-
-            logger.info(f"[schedule_2bar] Bars {bar1}-{bar2}: {len(messages)} events scheduled in pulse [{start_pulse}, {start_pulse + 2*pulses_per_bar})")
-
-        except Exception as e:
-            logger.exception(f"Failed to schedule 2-bar playback: {e}")
+        """DEPRECATED: Legacy 2-bar scheduling. Use _schedule_single_bar_playback instead.
+        
+        Kept for reference; not called in pipelined mode.
+        """
+        logger.debug(f"[_schedule_2bar_playback] DEPRECATED - called for bars {bar1}-{bar2} (ignored)")
+        pass
     
     def _play_midi_file_with_timing(self, midi_path: str):
         """Load and play a MIDI file with proper timing to output port."""

@@ -91,8 +91,8 @@ class AriaEngine:
         prompt_midi_path: str,
         prompt_duration_s: int = 4,
         horizon_s: float = 0.6,
-        temperature: float = 0.9,
-        top_p: Optional[float] = 0.95,
+        temperature: float = 0.8,
+        top_p: Optional[float] = 0.9,
         min_p: Optional[float] = None,
         max_new_tokens: Optional[int] = None,
     ) -> str:
@@ -103,8 +103,8 @@ class AriaEngine:
             prompt_midi_path: Path to .mid file
             prompt_duration_s: How many seconds of prompt to use
             horizon_s: How many seconds to generate (~0.6s for MVP)
-            temperature: Sampling temperature (0.9 recommended)
-            top_p: Top-p sampling (0.95 recommended)
+            temperature: Sampling temperature (0.8 default = conservative)
+            top_p: Top-p sampling (0.9 default = conservative)
             min_p: Min-p sampling (alternative to top_p)
             max_new_tokens: Max tokens to generate (auto-set if None)
 
