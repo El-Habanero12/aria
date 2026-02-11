@@ -5,7 +5,7 @@ counter. It detects block boundaries of N measures and invokes registered
 callbacks when a boundary is reached.
 
 Usage:
-    grid = ClockGrid(clock_port_name="ARIA_CLOCK", measures=2, beats_per_bar=4)
+    grid = ClockGrid(clock_port_name="ARIA_CLOCK", measures=4, beats_per_bar=4)
     grid.register_boundary_callback(cb)
     grid.start()
     ...
@@ -23,7 +23,7 @@ PPQN = 24  # MIDI clock pulses per quarter note
 
 
 class ClockGrid:
-    def __init__(self, clock_port_name: str = "ARIA_CLOCK", measures: int = 2, beats_per_bar: int = 4):
+    def __init__(self, clock_port_name: str = "ARIA_CLOCK", measures: int = 4, beats_per_bar: int = 4):
         self.clock_port_name = clock_port_name
         self.measures = measures
         self.beats_per_bar = beats_per_bar

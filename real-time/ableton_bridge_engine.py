@@ -122,9 +122,10 @@ class AbletonBridge:
         tempo_tracker=None,
         # Grid / clock parameters
         clock_in: Optional[str] = None,
-        measures: int = 2,
+        measures: int = 4,
         beats_per_bar: int = 4,
         gen_measures: Optional[int] = None,
+        human_measures: int = 1,
         cooldown_seconds: float = 0.2,
         temperature: float = 0.8,
         top_p: float = 0.9,
@@ -156,6 +157,7 @@ class AbletonBridge:
         self.measures = measures
         self.beats_per_bar = beats_per_bar
         self.gen_measures = gen_measures if gen_measures is not None else measures
+        self.human_measures = human_measures  # Number of measures to collect before generating
 
         self.cooldown_seconds = cooldown_seconds
         self.temperature = temperature
@@ -200,6 +202,7 @@ class AbletonBridge:
         self.anchor_pulse = None
         self.bar_index = 0
         self.next_bar_boundary_pulse = None
+        self.bars_collected_in_phase = 0  # Track bars collected in current PHASE_HUMAN
 
         # Per-bar buffering: bar_index -> list of (pulse, event_type, msg_data)
         self.human_bar_buffers = {}  # dict[int, list[TimestampedMidiMsg]]
@@ -558,6 +561,9 @@ class AbletonBridge:
                 # Clear human buffers for next cycle
                 self.human_bar_buffers.clear()
                 logger.debug("[service] Cleared human_bar_buffers for next cycle")
+                # Reset bars collected counter for next collection phase
+                self.bars_collected_in_phase = 0
+                logger.debug("[service] Reset bars_collected_in_phase for next cycle")
             self.phase = self.PHASE_HUMAN
             self.model_end_pulse = None
 
@@ -565,57 +571,69 @@ class AbletonBridge:
 
     def _on_bar_boundary(self, finished_bar: int):
         """
-        MVP Cycle: 1-bar-in → N-measures-out (configurable via --measures)
+        MVP Cycle: N-bars-in → M-measures-out (both configurable)
         
         PHASE_HUMAN:
-        - Collect input for current bar
-        - At bar boundary: if no AI playback pending, trigger N-measure generation
+        - Collect input for each bar (increment bars_collected_in_phase)
+        - When bars_collected_in_phase == human_measures: trigger M-measure generation
         - Switch to PHASE_AI_PLAY once response is ready
         
         PHASE_AI_PLAY:
-        - Play the N-measure AI response
+        - Play the M-measure AI response
         - Do NOT trigger new generation (block generation while playing)
-        - At playback end: switch back to PHASE_HUMAN, clear buffers
+        - At playback end: switch back to PHASE_HUMAN, clear buffers, reset counter
         """
         try:
-            logger.info(f"[bar_boundary] finished_bar={finished_bar}, phase={self.phase}")
+            logger.info(f"[bar_boundary] finished_bar={finished_bar}, phase={self.phase}, bars_collected={self.bars_collected_in_phase}")
 
             if self.phase == self.PHASE_HUMAN:
-                # Check if we should trigger generation
+                # Check if we have events for this bar
                 if finished_bar not in self.human_bar_buffers:
-                    logger.info(f"[bar_boundary] No human events for bar {finished_bar}, skipping generation")
+                    logger.info(f"[bar_boundary] No human events for bar {finished_bar}, skipping")
                     return
 
                 human_events = self.human_bar_buffers[finished_bar]
                 if not human_events:
-                    logger.info(f"[bar_boundary] Empty buffer for bar {finished_bar}, skipping generation")
+                    logger.info(f"[bar_boundary] Empty buffer for bar {finished_bar}, skipping")
                     return
 
-                logger.info(f"[bar_boundary] Bar {finished_bar}: {len(human_events)} prompt events, triggering 2-bar generation")
+                # Increment collected bars counter
+                self.bars_collected_in_phase += 1
+                logger.info(f"[bar_boundary] Bar {finished_bar}: {len(human_events)} events, collected {self.bars_collected_in_phase}/{self.human_measures} bars")
 
-                # Get prompt context: use last 2 bars if available
-                prompt_events = human_events
-                if finished_bar >= 1 and finished_bar - 1 in self.human_bar_buffers:
-                    prev_events = self.human_bar_buffers[finished_bar - 1]
-                    prompt_events = prev_events + human_events  # 2-bar context (fixed prompt window, independent of output measures)
+                # Check if we've collected enough bars to trigger generation
+                if self.bars_collected_in_phase < self.human_measures:
+                    logger.info(f"[bar_boundary] Waiting for {self.human_measures - self.bars_collected_in_phase} more bars before generating")
+                    return
 
-                # Enqueue generation job for N measures
+                # Collect all bars for prompt
+                prompt_events = []
+                for i in range(finished_bar - self.human_measures + 1, finished_bar + 1):
+                    if i >= 0 and i in self.human_bar_buffers:
+                        prompt_events.extend(self.human_bar_buffers[i])
+
+                logger.info(f"[bar_boundary] Collected {self.human_measures} bars ({len(prompt_events)} total events), triggering {self.gen_measures}-measure generation")
+
+                # Enqueue generation job for M measures
                 job = GenerationJob(
                     bar_index=finished_bar,
                     prompt_events=prompt_events,
                     aria_engine=self.aria_engine,
                     temperature=self.temperature,
                     top_p=self.top_p,
-                    gen_bars=self.gen_measures,  # Generate N measures per cycle
+                    gen_bars=self.gen_measures,  # Generate M measures per cycle
                 )
                 self.pending_ai_job = job
                 self.gen_job_queue.put(job)
-                logger.info(f"[enqueue] {self.gen_measures}-measure generation job for bar {finished_bar} queued")
+                logger.info(f"[enqueue] {self.gen_measures}-measure generation job for bar {finished_bar} queued (after {self.human_measures}-bar collection)")
                 self.last_generation_time = time.time()
                 self.generation_count += 1
+                
+                # Reset counter for next collection phase
+                self.bars_collected_in_phase = 0
 
             elif self.phase == self.PHASE_AI_PLAY:
-                # Block new generation while AI is playing - just log
+                # Block new generation while AI is playing
                 logger.debug(f"[bar_boundary] In PHASE_AI_PLAY, skipping generation trigger")
 
         except Exception as e:

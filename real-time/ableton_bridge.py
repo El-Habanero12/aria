@@ -144,6 +144,12 @@ def main():
         help="Measures to generate (default: same as --measures)",
     )
     parser.add_argument(
+        "--human_measures",
+        type=int,
+        default=1,
+        help="Number of human measures to collect before generating (default: 1)",
+    )
+    parser.add_argument(
         "--quantize",
         action="store_true",
         help="Quantize generated output to 1/16 note grid (default: off)",
@@ -254,6 +260,7 @@ def main():
             measures=args.measures,
             beats_per_bar=args.beats_per_bar,
             gen_measures=args.gen_measures,
+            human_measures=args.human_measures,
             cooldown_seconds=args.cooldown_seconds,
             temperature=args.temperature,
             top_p=args.top_p,
